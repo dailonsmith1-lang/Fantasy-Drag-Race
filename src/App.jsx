@@ -1,12 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-
-// ─── Storage ──────────────────────────────────────────────────────────────────
-async function persistRoom(code, data) {
-  try { await window.storage.set("fdr-" + code, JSON.stringify(data), true); } catch {}
-}
-async function fetchRoom(code) {
-  try { const r = await window.storage.get("fdr-" + code, true); return r ? JSON.parse(r.value) : null; } catch { return null; }
-}
+import { persistRoom, fetchRoom, subscribeRoom } from "./firebase";
 function genCode() { return Math.random().toString(36).substring(2, 7).toUpperCase(); }
 
 // ─── Season 18 Queens ─────────────────────────────────────────────────────────
@@ -120,14 +113,13 @@ export default function App() {
   // persist on every room change
   useEffect(() => { if (room && roomCode) persistRoom(roomCode, room); }, [room, roomCode]);
 
-  // sync remote changes every 4s while in room
+  // real-time sync via Firebase
   useEffect(() => {
     if (screen !== "room" || !roomCode) return;
-    syncRef.current = setInterval(async () => {
-      const remote = await fetchRoom(roomCode);
+    const unsub = subscribeRoom(roomCode, (remote) => {
       if (remote && remote.ts > (room?.ts ?? 0)) setRoom(remote);
-    }, 4000);
-    return () => clearInterval(syncRef.current);
+    });
+    return () => unsub();
   }, [screen, roomCode]);
 
   function upd(fn) {
