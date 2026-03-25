@@ -1,6 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { persistRoom, fetchRoom, subscribeRoom } from "./firebase";
 function genCode() { return Math.random().toString(36).substring(2, 7).toUpperCase(); }
+function genPin() { return Math.floor(100000 + Math.random() * 900000).toString(); }
+function saveMyId(roomCode, id) { try { localStorage.setItem("fdr_" + roomCode, id); } catch {} }
+function loadMyId(roomCode) { try { return localStorage.getItem("fdr_" + roomCode); } catch { return null; } }
 
 // ─── Season 18 Queens ─────────────────────────────────────────────────────────
 const S18 = [
@@ -100,7 +103,11 @@ function SpinWheel({ players, onResult }) {
 // ROOT COMPONENT — single return, screen controlled by state
 // ─────────────────────────────────────────────────────────────────────────────
 export default function App() {
-  const [screen, setScreen]       = useState("home"); // home | host | join | room
+  const [screen, setScreen]       = useState("home"); // home | join | rejoin | pinSaved | room
+  const [myPin, setMyPin]         = useState("");
+  const [rejoinPin, setRejoinPin] = useState("");
+  const [rejoinCode, setRejoinCode] = useState("");
+  const [emergencyPid, setEmergencyPid] = useState(null);
   const [playerName, setName]     = useState("");
   const [joinCode, setJoinCode]   = useState("");
   const [msg, setMsg]             = useState("");
@@ -132,25 +139,64 @@ export default function App() {
 
   function doCreateRoom() {
     if (!playerName.trim()) { setMsg("Enter your name!"); return; }
-    const code = genCode(), id = genCode();
+    const code = genCode(), id = genCode(), pin = genPin();
     const r = {
       code, hostId: id, queens: ALL_QUEENS,
-      players: [{ id, name: playerName.trim(), queen: null, points: 0, paid: true, eliminated: false }],
+      players: [{ id, name: playerName.trim(), queen: null, points: 0, paid: true, eliminated: false, pin }],
       draftOrder: [], draftDone: false, episodes: [], polls: [],
       ts: Date.now()
     };
-    setRoom(r); setMyId(id); setRoomCode(code); setMsg(""); setTab("draft"); setScreen("room");
+    setRoom(r); setMyId(id); setRoomCode(code); setMyPin(pin); setMsg("");
+    saveMyId(code, id);
+    setTab("draft"); setScreen("pinSaved");
   }
 
   async function doJoinRoom() {
     if (!playerName.trim()) { setMsg("Enter your name!"); return; }
     if (!joinCode.trim())   { setMsg("Enter a room code!"); return; }
     setMsg("Looking up room…");
-    const remote = await fetchRoom(joinCode.toUpperCase().trim());
+    const code = joinCode.toUpperCase().trim();
+    const remote = await fetchRoom(code);
     if (!remote) { setMsg("Room not found! Double-check the code."); return; }
-    const id = genCode();
-    const updated = { ...remote, players: [...remote.players, { id, name: playerName.trim(), queen: null, points: 0, paid: false, eliminated: false }], ts: Date.now() };
-    setRoom(updated); setMyId(id); setRoomCode(remote.code); setMsg(""); setTab("scoreboard"); setScreen("room");
+    // Check if they already have a saved ID for this room (localStorage)
+    const savedId = loadMyId(code);
+    if (savedId) {
+      const existing = remote.players.find(p => p.id === savedId);
+      if (existing) {
+        setRoom(remote); setMyId(savedId); setRoomCode(code);
+        setMsg("");
+        setTab(savedId === remote.hostId && !remote.draftDone ? "draft" : "scoreboard");
+        setScreen("room"); return;
+      }
+    }
+    // New player — generate PIN and add them
+    const id = genCode(), pin = genPin();
+    const updated = { ...remote, players: [...remote.players, { id, name: playerName.trim(), queen: null, points: 0, paid: false, eliminated: false, pin }], ts: Date.now() };
+    setRoom(updated); setMyId(id); setRoomCode(code); setMyPin(pin);
+    saveMyId(code, id);
+    setMsg(""); setTab("scoreboard"); setScreen("pinSaved");
+  }
+
+  async function doRejoin() {
+    if (!rejoinCode.trim()) { setMsg("Enter your room code!"); return; }
+    if (!rejoinPin.trim())  { setMsg("Enter your PIN!"); return; }
+    setMsg("Looking up room…");
+    const code = rejoinCode.toUpperCase().trim();
+    const remote = await fetchRoom(code);
+    if (!remote) { setMsg("Room not found! Double-check the code."); return; }
+    const player = remote.players.find(p => p.pin === rejoinPin.trim());
+    if (!player) { setMsg("PIN not found! Check your PIN and try again."); return; }
+    saveMyId(code, player.id);
+    setRoom(remote); setMyId(player.id); setRoomCode(code);
+    setMsg("");
+    // Restore host to draft tab if draft not done, otherwise scoreboard
+    setTab(player.id === remote.hostId && !remote.draftDone ? "draft" : "scoreboard");
+    setScreen("room");
+  }
+
+  function emergencyReassign(pid, queen) {
+    upd(r => ({ ...r, players: r.players.map(p => p.id === pid ? { ...p, queen } : p) }));
+    setEmergencyPid(null);
   }
 
   function assignQueen(pid, queen) { upd(r => ({ ...r, players: r.players.map(p => p.id === pid ? { ...p, queen } : p) })); }
@@ -168,6 +214,13 @@ export default function App() {
         return { ...p, points: p.points + pts, eliminated: (form.eliminated && p.queen === form.eliminated) ? true : p.eliminated };
       });
       return { ...r, episodes: [...r.episodes, ep], players };
+    });
+  }
+
+  function declareSeasonWinner(queenName) {
+    upd(r => {
+      const winner = r.players.find(p => p.queen === queenName);
+      return { ...r, seasonWinner: winner ? winner.id : null };
     });
   }
 
@@ -308,9 +361,62 @@ export default function App() {
               onKeyDown={e => e.key === "Enter" && doCreateRoom()}
               style={S.input}
             />
-            <button onClick={doCreateRoom} style={S.goldBtn}>🏆 HOST A ROOM</button>
-            <button onClick={() => { if (!playerName.trim()) { setMsg("Enter your name first!"); return; } setMsg(""); setScreen("join"); }} style={S.redBtn}>🔗 JOIN A ROOM</button>
+            <button onClick={doCreateRoom} style={S.goldBtn}>🏆 HOST A NEW GAME</button>
+            <button onClick={() => { if (!playerName.trim()) { setMsg("Enter your name first!"); return; } setMsg(""); setScreen("join"); }} style={S.redBtn}>🔗 JOIN A GAME</button>
+            <div style={{ height:1, background:`linear-gradient(90deg,transparent,${C.bgLight},transparent)`, margin:"4px 0" }} />
+            <button onClick={() => { setMsg(""); setScreen("rejoin"); }}
+              style={{ background:`linear-gradient(135deg,${C.bgMid},${C.bgDeep})`, border:`1px solid ${C.gold}`, color:C.gold, borderRadius:10, padding:"12px 22px", fontSize:14, fontWeight:700, cursor:"pointer", fontFamily:"'Lato',sans-serif", letterSpacing:.3 }}>
+              🔑 RETURN TO MY GAME
+            </button>
             {msg && <p style={{ color:C.pinkLight, textAlign:"center", fontSize:13, fontFamily:"'Lato',sans-serif" }}>{msg}</p>}
+          </div>
+        </div>
+      )}
+
+      {/* ═══════════════════════════════════════════════════════
+          PIN SAVED SCREEN
+      ═══════════════════════════════════════════════════════ */}
+      {screen === "pinSaved" && (
+        <div style={{ minHeight:"100vh", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", padding:24, position:"relative", zIndex:10 }}>
+          <div style={{ width:"100%", maxWidth:340, textAlign:"center" }}>
+            <div style={{ fontSize:48, marginBottom:12 }}>🔑</div>
+            <h2 style={{ ...S.h2, marginBottom:8, textAlign:"center" }}>Save Your PIN!</h2>
+            <p style={{ color:C.textMid, fontSize:14, marginBottom:24, fontFamily:"'Lato',sans-serif", lineHeight:1.6 }}>
+              This is your personal PIN. If you ever lose access to the game, use this to rejoin as yourself with your queen and points intact.
+            </p>
+            <div style={{ background:`linear-gradient(135deg,${C.bgMid},${C.bgDeep})`, border:`2px solid ${C.gold}`, borderRadius:16, padding:"24px 32px", marginBottom:24 }}>
+              <div style={{ color:C.textDim, fontSize:12, letterSpacing:3, fontFamily:"'Lato',sans-serif", marginBottom:8 }}>YOUR PIN</div>
+              <div className="gold-text" style={{ fontSize:48, fontWeight:900, letterSpacing:8 }}>{myPin}</div>
+            </div>
+            <p style={{ color:C.pinkLight, fontSize:13, marginBottom:24, fontFamily:"'Lato',sans-serif" }}>
+              ⚠️ Screenshot this or write it down — you won't see it again!
+            </p>
+            <button onClick={() => setScreen("room")} style={{ ...S.goldBtn, width:"100%" }}>
+              ✅ I've Saved My PIN — Enter the Game
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ═══════════════════════════════════════════════════════
+          REJOIN SCREEN
+      ═══════════════════════════════════════════════════════ */}
+      {screen === "rejoin" && (
+        <div style={{ minHeight:"100vh", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", padding:24, position:"relative", zIndex:10 }}>
+          <h2 style={{ ...S.h2, marginBottom:8 }}>Return to Your Game</h2>
+          <p style={{ color:C.textMid, fontSize:14, marginBottom:20, fontFamily:"'Lato',sans-serif", lineHeight:1.6 }}>
+            Enter your room code and PIN to pick up right where you left off — works for both hosts and players. Your queen, points, and host powers will all be restored.
+          </p>
+          <div style={{ width:"100%", maxWidth:320, display:"flex", flexDirection:"column", gap:12 }}>
+            <input placeholder="Room code  e.g.  XK9AB" value={rejoinCode}
+              onChange={e => setRejoinCode(e.target.value.toUpperCase())}
+              style={{ ...S.input, letterSpacing:4, fontWeight:700, fontSize:20, textAlign:"center" }} />
+            <input placeholder="Your 6-digit PIN" value={rejoinPin}
+              onChange={e => setRejoinPin(e.target.value.replace(/\D/g, "").slice(0,6))}
+              style={{ ...S.input, letterSpacing:6, fontWeight:700, fontSize:24, textAlign:"center" }} />
+            <button onClick={doRejoin} style={S.goldBtn}>🔑 REJOIN GAME</button>
+            <button onClick={() => { setScreen("home"); setMsg(""); }} style={S.ghost}>← Back</button>
+            {msg && <p style={{ color:C.pinkLight, fontSize:13, fontFamily:"'Lato',sans-serif" }}>{msg}</p>}
           </div>
         </div>
       )}
@@ -367,10 +473,10 @@ export default function App() {
           {/* Content */}
           <div style={{ padding:"18px 14px", maxWidth:680, margin:"0 auto" }}>
 
-            {tab === "scoreboard" && <ScoreTab sorted={sorted} myId={myId} players={room.players} />}
+            {tab === "scoreboard" && <ScoreTab sorted={sorted} myId={myId} players={room.players} room={room} isHost={isHost} onEmergencyReassign={emergencyReassign} />}
             {tab === "queens"     && <QueensTab room={room} isHost={isHost} onAssign={assignQueen} />}
             {tab === "draft"      && <DraftTab room={room} isHost={isHost} onSpin={spinResult} onAssign={assignQueen} onLock={lockDraft} />}
-            {tab === "episodes"   && <EpisodesTab room={room} isHost={isHost} onLog={logEpisode} />}
+            {tab === "episodes"   && <EpisodesTab room={room} isHost={isHost} onLog={logEpisode} onDeclare={declareSeasonWinner} />}
             {tab === "polls"      && <PollsTab room={room} myId={myId} isHost={isHost} onAdd={addPoll} onVote={castVote} onToot={castToot} onSeal={sealPoll} />}
 
           </div>
@@ -383,8 +489,13 @@ export default function App() {
 // ─────────────────────────────────────────────────────────────────────────────
 // SCOREBOARD TAB
 // ─────────────────────────────────────────────────────────────────────────────
-function ScoreTab({ sorted, myId, players }) {
+function ScoreTab({ sorted, myId, players, room, isHost, onEmergencyReassign }) {
   const pool = players.filter(p => p.paid).length * 20;
+  const [showPins, setShowPins] = useState(false);
+  const [emergencyPid, setEmergencyPid] = useState(null);
+  const [emergencyQueen, setEmergencyQueen] = useState("");
+  const seasonWinner = room.seasonWinner ? players.find(p => p.id === room.seasonWinner) : null;
+  const available = room.queens.filter(q => !players.some(p => p.queen === q));
   return (
     <div className="fade">
       <SecTitle>Scoreboard</SecTitle>
@@ -393,11 +504,80 @@ function ScoreTab({ sorted, myId, players }) {
         <StatBox label="Winner Gets" value="$300"       gold />
         <StatBox label="Players"     value={players.length} />
       </div>
+      {/* Season winner banner */}
+      {seasonWinner && (
+        <div className="card" style={{ padding:"16px", marginBottom:18, border:`2px solid ${C.gold}`, textAlign:"center" }}>
+          <div style={{ fontSize:32, marginBottom:4 }}>👑</div>
+          <div className="gold-text" style={{ fontSize:20, fontWeight:900 }}>SEASON WINNER</div>
+          <div style={{ color:C.white, fontSize:16, fontWeight:700, marginTop:4, fontFamily:"'Lato',sans-serif" }}>{seasonWinner.name}</div>
+          <div style={{ color:C.textDim, fontSize:13, marginTop:2 }}>{seasonWinner.queen} · $300 🎉</div>
+        </div>
+      )}
+
+      {/* Host tools */}
+      {isHost && (
+        <div style={{ marginBottom:16, display:"flex", gap:10, flexWrap:"wrap" }}>
+          <button onClick={() => setShowPins(!showPins)}
+            style={{ ...S.ghost, fontSize:12 }}>🔑 {showPins ? "Hide" : "View"} Player PINs</button>
+          <button onClick={() => setEmergencyPid(emergencyPid ? null : "pick")}
+            style={{ background:`${C.red}33`, border:`1px solid ${C.red}`, color:C.pinkLight, borderRadius:8, padding:"6px 14px", cursor:"pointer", fontSize:12, fontFamily:"'Lato',sans-serif" }}>
+            ⚠️ Emergency Reassign
+          </button>
+        </div>
+      )}
+
+      {/* PIN list for host */}
+      {isHost && showPins && (
+        <div className="card" style={{ padding:"12px 16px", marginBottom:16, border:`1px solid ${C.gold}44` }}>
+          <div style={{ color:C.gold, fontWeight:700, fontSize:13, marginBottom:10, fontFamily:"'Cinzel',serif" }}>Player PINs</div>
+          {players.map(p => (
+            <div key={p.id} style={{ display:"flex", justifyContent:"space-between", padding:"6px 0", borderBottom:`1px solid ${C.bgLight}` }}>
+              <span style={{ color:C.white, fontSize:13, fontFamily:"'Lato',sans-serif" }}>{p.name}</span>
+              <span style={{ color:C.gold, fontWeight:700, letterSpacing:3, fontSize:13 }}>{p.pin || "—"}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Emergency reassign */}
+      {isHost && emergencyPid && (
+        <div className="card" style={{ padding:"14px 16px", marginBottom:16, border:`1px solid ${C.red}` }}>
+          <div style={{ color:C.pinkLight, fontWeight:700, fontSize:14, marginBottom:12, fontFamily:"'Cinzel',serif" }}>⚠️ Emergency Queen Reassign</div>
+          <div style={{ marginBottom:10 }}>
+            <FL>Select Player</FL>
+            <select value={emergencyPid === "pick" ? "" : emergencyPid}
+              onChange={e => setEmergencyPid(e.target.value)}
+              style={{ ...S.input, color: emergencyPid !== "pick" ? C.white : C.textDim }}>
+              <option value="">— Select player —</option>
+              {players.map(p => <option key={p.id} value={p.id}>{p.name} {p.queen ? `(${p.queen})` : "(no queen)"}</option>)}
+            </select>
+          </div>
+          {emergencyPid && emergencyPid !== "pick" && (
+            <div style={{ marginBottom:10 }}>
+              <FL>Assign New Queen</FL>
+              <select value={emergencyQueen} onChange={e => setEmergencyQueen(e.target.value)}
+                style={{ ...S.input, color: emergencyQueen ? C.white : C.textDim }}>
+                <option value="">— Select queen —</option>
+                {room.queens.filter(q => !players.some(p => p.queen === q)).map(q => <option key={q} value={q}>{q}</option>)}
+              </select>
+            </div>
+          )}
+          <div style={{ display:"flex", gap:10 }}>
+            {emergencyPid && emergencyPid !== "pick" && emergencyQueen && (
+              <button onClick={() => { onEmergencyReassign(emergencyPid, emergencyQueen); setEmergencyPid(null); setEmergencyQueen(""); }}
+                style={{ ...S.redBtn, padding:"8px 16px", fontSize:13 }}>✓ Confirm Reassign</button>
+            )}
+            <button onClick={() => { setEmergencyPid(null); setEmergencyQueen(""); }} style={{ ...S.ghost, padding:"8px 12px", fontSize:12 }}>Cancel</button>
+          </div>
+        </div>
+      )}
+
       {sorted.map((p, i) => (
         <div key={p.id} className="card" style={{
           display:"flex", alignItems:"center", padding:"12px 14px", marginBottom:10, gap:12,
           border:`1px solid ${p.id === myId ? C.gold : C.cardBorder}`,
-          boxShadow: p.id === myId ? `0 0 18px ${C.gold}22` : "none"
+          boxShadow: p.id === myId ? `0 0 18px ${C.gold}22` : "none",
+          opacity: p.eliminated ? 0.6 : 1
         }}>
           <div style={{
             width:34, height:34, borderRadius:"50%", flexShrink:0,
@@ -602,7 +782,7 @@ const EP_FIELDS = [
   { key:"eliminated",          label:"☠️ Eliminated Queen",      type:"queen", req:false },
 ];
 
-function EpisodesTab({ room, isHost, onLog }) {
+function EpisodesTab({ room, isHost, onLog, onDeclare }) {
   const [form, setForm] = useState(BLANK);
   const [open, setOpen] = useState(false);
   const [err,  setErr]  = useState("");
@@ -648,6 +828,18 @@ function EpisodesTab({ room, isHost, onLog }) {
           </div>
         </div>
       )}
+      {/* Declare season winner */}
+      {isHost && room.draftDone && !room.seasonWinner && (
+        <SeasonWinnerPanel room={room} onDeclare={declareSeasonWinner} />
+      )}
+      {room.seasonWinner && (() => {
+        const w = room.players.find(p => p.id === room.seasonWinner);
+        return w ? (
+          <div className="card" style={{ padding:"14px 16px", marginBottom:18, border:`2px solid ${C.gold}`, textAlign:"center" }}>
+            <div className="gold-text" style={{ fontSize:16, fontWeight:900 }}>👑 Season Winner: {w.name} ({w.queen}) — $300!</div>
+          </div>
+        ) : null;
+      })()}
       {room.episodes.length === 0 && <p style={{ color:C.textDim, fontFamily:"'Lato',sans-serif" }}>No episodes logged yet.</p>}
       {[...room.episodes].reverse().map((ep, i) => (
         <div key={i} className="card" style={{ padding:14, marginBottom:12 }}>
@@ -663,6 +855,41 @@ function EpisodesTab({ room, isHost, onLog }) {
           </div>
         </div>
       ))}
+    </div>
+  );
+}
+
+function SeasonWinnerPanel({ room, onDeclare }) {
+  const [queen, setQueen] = useState("");
+  const [confirm, setConfirm] = useState(false);
+  if (confirm) return (
+    <div className="card" style={{ padding:"16px", marginBottom:18, border:`2px solid ${C.gold}`, textAlign:"center" }}>
+      <div style={{ fontSize:32, marginBottom:8 }}>👑</div>
+      <div style={{ color:C.white, fontWeight:700, fontSize:15, marginBottom:16, fontFamily:"'Lato',sans-serif" }}>
+        Declare <span style={{ color:C.gold }}>{queen}</span> as the Season 18 winner?<br/>
+        <span style={{ fontSize:13, color:C.textMid }}>This awards $300 to their player and cannot be undone.</span>
+      </div>
+      <div style={{ display:"flex", gap:10, justifyContent:"center" }}>
+        <button onClick={() => onDeclare(queen)} style={S.goldBtn}>👑 Confirm Winner</button>
+        <button onClick={() => setConfirm(false)} style={S.ghost}>Cancel</button>
+      </div>
+    </div>
+  );
+  return (
+    <div className="card" style={{ padding:"14px 16px", marginBottom:18, border:`1px solid ${C.gold}44` }}>
+      <div style={{ color:C.gold, fontWeight:700, fontSize:14, marginBottom:12, fontFamily:"'Cinzel',serif" }}>🏆 Declare Season Winner</div>
+      <select value={queen} onChange={e => setQueen(e.target.value)}
+        style={{ ...S.input, color: queen ? C.white : C.textDim, marginBottom:10 }}>
+        <option value="">Select the winning queen…</option>
+        {room.queens.filter(q => room.players.some(p => p.queen === q)).map(q => (
+          <option key={q} value={q}>{q}</option>
+        ))}
+      </select>
+      {queen && (
+        <button onClick={() => setConfirm(true)} style={{ ...S.goldBtn, width:"100%" }}>
+          👑 Declare Winner
+        </button>
+      )}
     </div>
   );
 }
