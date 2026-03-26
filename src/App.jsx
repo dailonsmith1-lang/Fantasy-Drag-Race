@@ -142,7 +142,7 @@ export default function App() {
     const code = genCode(), id = genCode(), pin = genPin();
     const r = {
       code, hostId: id, queens: ALL_QUEENS,
-      players: [{ id, name: playerName.trim(), queen: null, points: 0, paid: true, eliminated: false, pin }],
+      players: [{ id, name: playerName.trim(), queen: null, points: 10, paid: true, eliminated: false, pin }],
       draftOrder: [], draftDone: false, episodes: [], polls: [],
       ts: Date.now()
     };
@@ -171,7 +171,7 @@ export default function App() {
     }
     // New player — generate PIN and add them
     const id = genCode(), pin = genPin();
-    const updated = { ...remote, players: [...remote.players, { id, name: playerName.trim(), queen: null, points: 0, paid: false, eliminated: false, pin }], ts: Date.now() };
+    const updated = { ...remote, players: [...remote.players, { id, name: playerName.trim(), queen: null, points: 10, paid: false, eliminated: false, pin }], ts: Date.now() };
     setRoom(updated); setMyId(id); setRoomCode(code); setMyPin(pin);
     saveMyId(code, id);
     setMsg(""); setTab("scoreboard"); setScreen("pinSaved");
@@ -195,12 +195,54 @@ export default function App() {
   }
 
   function emergencyReassign(pid, queen) {
-    upd(r => ({ ...r, players: r.players.map(p => p.id === pid ? { ...p, queen } : p) }));
+    upd(r => {
+      // Reverse old queen's points from episodes, then apply new queen's points
+      const oldPlayer = r.players.find(p => p.id === pid);
+      const oldQueen  = oldPlayer?.queen;
+      let delta = 0;
+      let shouldBeEliminated = false;
+      (r.episodes || []).forEach(ep => {
+        // Remove old queen's contributions
+        if (oldQueen) {
+          if (ep.winner              === oldQueen) delta -= 20;
+          if (ep.lipSyncWinner       === oldQueen) delta -= 5;
+          if (ep.miniChallengeWinner === oldQueen) delta -= 5;
+        }
+        // Add new queen's contributions
+        if (ep.winner              === queen) delta += 20;
+        if (ep.lipSyncWinner       === queen) delta += 5;
+        if (ep.miniChallengeWinner === queen) delta += 5;
+        if (ep.eliminated          === queen) shouldBeEliminated = true;
+      });
+      const players = r.players.map(p =>
+        p.id === pid ? { ...p, queen, points: p.points + delta, eliminated: shouldBeEliminated } : p
+      );
+      return { ...r, players };
+    });
     setEmergencyPid(null);
   }
 
-  function assignQueen(pid, queen) { upd(r => ({ ...r, players: r.players.map(p => p.id === pid ? { ...p, queen } : p) })); }
-  function spinResult(player)      { upd(r => ({ ...r, draftOrder: [...r.draftOrder, player.id] })); }
+  function assignQueen(pid, queen) {
+    upd(r => {
+      // Calculate how many points this queen has earned across all logged episodes
+      let backtrackPts = 0;
+      let shouldBeEliminated = false;
+      (r.episodes || []).forEach(ep => {
+        if (ep.winner              && ep.winner              === queen) backtrackPts += 20;
+        if (ep.lipSyncWinner       && ep.lipSyncWinner       === queen) backtrackPts += 5;
+        if (ep.miniChallengeWinner && ep.miniChallengeWinner === queen) backtrackPts += 5;
+        if (ep.eliminated          && ep.eliminated          === queen) shouldBeEliminated = true;
+      });
+      const players = r.players.map(p => {
+        if (p.id !== pid) return p;
+        return { ...p, queen, points: p.points + backtrackPts, eliminated: shouldBeEliminated };
+      });
+      return { ...r, players };
+    });
+  }
+  function rewardAllPlayers(pts) {
+    upd(r => ({ ...r, players: r.players.map(p => ({ ...p, points: p.points + pts })) }));
+  }
   function lockDraft()             { upd(r => ({ ...r, draftDone: true })); }
 
   function logEpisode(form) {
@@ -247,7 +289,6 @@ export default function App() {
     { id:"draft",      label:"🎡 Draft"    },
     { id:"episodes",   label:"🎬 Episodes" },
     { id:"polls",      label:"📊 Polls"    },
-    { id:"chaos",      label:"🃏 Chaos"    },
   ];
 
   // ── single return ──
@@ -474,12 +515,11 @@ export default function App() {
           {/* Content */}
           <div style={{ padding:"18px 14px", maxWidth:680, margin:"0 auto" }}>
 
-            {tab === "scoreboard" && <ScoreTab sorted={sorted} myId={myId} players={room.players} room={room} isHost={isHost} onEmergencyReassign={emergencyReassign} />}
+            {tab === "scoreboard" && <ScoreTab sorted={sorted} myId={myId} players={room.players} room={room} isHost={isHost} onEmergencyReassign={emergencyReassign} onUpdatePlayer={updatePlayer} onRemovePlayer={removePlayer} onRewardAll={rewardAllPlayers} />}
             {tab === "queens"     && <QueensTab room={room} isHost={isHost} onAssign={assignQueen} />}
             {tab === "draft"      && <DraftTab room={room} isHost={isHost} onSpin={spinResult} onAssign={assignQueen} onLock={lockDraft} />}
-            {tab === "episodes"   && <EpisodesTab room={room} isHost={isHost} onLog={logEpisode} onDeclare={declareSeasonWinner} />}
+            {tab === "episodes"   && <EpisodesTab room={room} isHost={isHost} onLog={logEpisode} onEdit={editEpisode} onDeclare={declareSeasonWinner} />}
             {tab === "polls"      && <PollsTab room={room} myId={myId} isHost={isHost} onAdd={addPoll} onVote={castVote} onToot={castToot} onSeal={sealPoll} />}
-            {tab === "chaos"      && <ChaosTab room={room} myId={myId} me={me} isHost={isHost} onUpdateRoom={upd} />}
 
           </div>
         </div>
@@ -491,13 +531,31 @@ export default function App() {
 // ─────────────────────────────────────────────────────────────────────────────
 // SCOREBOARD TAB
 // ─────────────────────────────────────────────────────────────────────────────
-function ScoreTab({ sorted, myId, players, room, isHost, onEmergencyReassign }) {
+function ScoreTab({ sorted, myId, players, room, isHost, onEmergencyReassign, onUpdatePlayer, onRemovePlayer, onRewardAll }) {
   const pool = players.filter(p => p.paid).length * 20;
-  const [showPins, setShowPins] = useState(false);
-  const [emergencyPid, setEmergencyPid] = useState(null);
+  const [showPins, setShowPins]             = useState(false);
+  const [emergencyPid, setEmergencyPid]     = useState(null);
   const [emergencyQueen, setEmergencyQueen] = useState("");
+  const [managingPid, setManagingPid]       = useState(null);
+  const [editName, setEditName]             = useState("");
+  const [editPoints, setEditPoints]         = useState("");
+  const [confirmRemove, setConfirmRemove]   = useState(null);
+  const [rewardFlash, setRewardFlash]       = useState(false);
   const seasonWinner = room.seasonWinner ? players.find(p => p.id === room.seasonWinner) : null;
-  const available = room.queens.filter(q => !players.some(p => p.queen === q));
+
+  function startManage(p) {
+    setManagingPid(p.id); setEditName(p.name); setEditPoints(String(p.points)); setConfirmRemove(null);
+  }
+  function savePlayer() {
+    const pts = parseInt(editPoints, 10);
+    onUpdatePlayer(managingPid, { name: editName.trim() || undefined, points: isNaN(pts) ? undefined : pts });
+    setManagingPid(null);
+  }
+  function doRemove(pid) { onRemovePlayer(pid); setManagingPid(null); setConfirmRemove(null); }
+  function handleRewardAll() {
+    onRewardAll(10); setRewardFlash(true); setTimeout(() => setRewardFlash(false), 2000);
+  }
+
   return (
     <div className="fade">
       <SecTitle>Scoreboard</SecTitle>
@@ -506,6 +564,7 @@ function ScoreTab({ sorted, myId, players, room, isHost, onEmergencyReassign }) 
         <StatBox label="Winner Gets" value="$300"       gold />
         <StatBox label="Players"     value={players.length} />
       </div>
+
       {/* Season winner banner */}
       {seasonWinner && (
         <div className="card" style={{ padding:"16px", marginBottom:18, border:`2px solid ${C.gold}`, textAlign:"center" }}>
@@ -519,16 +578,21 @@ function ScoreTab({ sorted, myId, players, room, isHost, onEmergencyReassign }) 
       {/* Host tools */}
       {isHost && (
         <div style={{ marginBottom:16, display:"flex", gap:10, flexWrap:"wrap" }}>
-          <button onClick={() => setShowPins(!showPins)}
-            style={{ ...S.ghost, fontSize:12 }}>🔑 {showPins ? "Hide" : "View"} Player PINs</button>
+          <button onClick={() => setShowPins(!showPins)} style={{ ...S.ghost, fontSize:12 }}>
+            🔑 {showPins ? "Hide" : "View"} Player PINs
+          </button>
           <button onClick={() => setEmergencyPid(emergencyPid ? null : "pick")}
             style={{ background:`${C.red}33`, border:`1px solid ${C.red}`, color:C.pinkLight, borderRadius:8, padding:"6px 14px", cursor:"pointer", fontSize:12, fontFamily:"'Lato',sans-serif" }}>
             ⚠️ Emergency Reassign
           </button>
+          <button onClick={handleRewardAll}
+            style={{ background: rewardFlash ? `${C.gold}44` : `${C.gold}22`, border:`1px solid ${C.gold}88`, color:C.gold, borderRadius:8, padding:"6px 14px", cursor:"pointer", fontSize:12, fontFamily:"'Lato',sans-serif", transition:"background 0.3s" }}>
+            {rewardFlash ? "✅ +10 pts awarded!" : "🎁 Give Everyone +10 pts"}
+          </button>
         </div>
       )}
 
-      {/* PIN list for host */}
+      {/* PIN list */}
       {isHost && showPins && (
         <div className="card" style={{ padding:"12px 16px", marginBottom:16, border:`1px solid ${C.gold}44` }}>
           <div style={{ color:C.gold, fontWeight:700, fontSize:13, marginBottom:10, fontFamily:"'Cinzel',serif" }}>Player PINs</div>
@@ -574,6 +638,49 @@ function ScoreTab({ sorted, myId, players, room, isHost, onEmergencyReassign }) 
         </div>
       )}
 
+      {/* Edit player modal */}
+      {isHost && managingPid && (() => {
+        const mp = players.find(p => p.id === managingPid);
+        if (!mp) return null;
+        return (
+          <div style={{ position:"fixed", inset:0, zIndex:200, background:"rgba(0,0,0,0.85)", display:"flex", alignItems:"center", justifyContent:"center", padding:20, backdropFilter:"blur(6px)" }}>
+            <div className="card" style={{ width:"100%", maxWidth:360, padding:"24px 20px", border:`1px solid ${C.gold}55` }}>
+              <div style={{ color:C.gold, fontWeight:700, fontSize:16, marginBottom:16, fontFamily:"'Cinzel',serif" }}>✏️ Edit Player — {mp.name}</div>
+              <div style={{ marginBottom:12 }}>
+                <FL>Display Name</FL>
+                <input value={editName} onChange={e => setEditName(e.target.value)} style={S.input} />
+              </div>
+              <div style={{ marginBottom:16 }}>
+                <FL>Points (manual override)</FL>
+                <input type="number" value={editPoints} onChange={e => setEditPoints(e.target.value)} style={S.input} />
+                <p style={{ color:C.textDim, fontSize:11, marginTop:4, fontFamily:"'Lato',sans-serif" }}>⚠️ This directly overwrites their score — use carefully.</p>
+              </div>
+              <div style={{ height:1, background:`linear-gradient(90deg,transparent,${C.bgLight},transparent)`, marginBottom:14 }} />
+              {confirmRemove === managingPid ? (
+                <div style={{ background:`${C.red}18`, border:`1px solid ${C.red}55`, borderRadius:10, padding:"12px 14px", marginBottom:14 }}>
+                  <div style={{ color:C.pinkLight, fontWeight:700, fontSize:13, marginBottom:8, fontFamily:"'Cinzel',serif" }}>Remove {mp.name}?</div>
+                  <div style={{ color:C.textDim, fontSize:12, marginBottom:12, fontFamily:"'Lato',sans-serif" }}>This will permanently remove them from the game.</div>
+                  <div style={{ display:"flex", gap:8 }}>
+                    <button onClick={() => doRemove(managingPid)} style={{ ...S.redBtn, padding:"8px 14px", fontSize:12 }}>Yes, Remove</button>
+                    <button onClick={() => setConfirmRemove(null)} style={{ ...S.ghost, padding:"8px 12px", fontSize:12 }}>Cancel</button>
+                  </div>
+                </div>
+              ) : (
+                <button onClick={() => setConfirmRemove(managingPid)}
+                  style={{ background:`${C.red}22`, border:`1px solid ${C.red}55`, color:C.pinkLight, borderRadius:8, padding:"8px 14px", cursor:"pointer", fontSize:12, fontFamily:"'Lato',sans-serif", marginBottom:14, width:"100%" }}>
+                  🗑️ Remove Player
+                </button>
+              )}
+              <div style={{ display:"flex", gap:10 }}>
+                <button onClick={savePlayer} style={{ ...S.goldBtn, flex:1 }}>💾 Save Changes</button>
+                <button onClick={() => { setManagingPid(null); setConfirmRemove(null); }} style={S.ghost}>Cancel</button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Player list */}
       {sorted.map((p, i) => (
         <div key={p.id} className="card" style={{
           display:"flex", alignItems:"center", padding:"12px 14px", marginBottom:10, gap:12,
@@ -600,9 +707,17 @@ function ScoreTab({ sorted, myId, players, room, isHost, onEmergencyReassign }) 
               {p.queen ? `👑 ${p.queen}` : "No queen yet"}{p.eliminated ? " · ☠️ Out" : ""}
             </div>
           </div>
-          <div style={{ textAlign:"right", flexShrink:0 }}>
-            <div className="gold-text" style={{ fontWeight:900, fontSize:24, lineHeight:1 }}>{p.points}</div>
-            <div style={{ color:C.textDim, fontSize:11 }}>pts</div>
+          <div style={{ display:"flex", alignItems:"center", gap:10, flexShrink:0 }}>
+            <div style={{ textAlign:"right" }}>
+              <div className="gold-text" style={{ fontWeight:900, fontSize:24, lineHeight:1 }}>{p.points}</div>
+              <div style={{ color:C.textDim, fontSize:11 }}>pts</div>
+            </div>
+            {isHost && (
+              <button onClick={() => startManage(p)}
+                style={{ background:`${C.gold}18`, border:`1px solid ${C.gold}44`, color:C.gold, borderRadius:8, padding:"5px 10px", cursor:"pointer", fontSize:12, fontFamily:"'Lato',sans-serif", flexShrink:0 }}>
+                ✏️
+              </button>
+            )}
           </div>
         </div>
       ))}
@@ -1120,451 +1235,6 @@ function PollsTab({ room, myId, isHost, onAdd, onVote, onToot, onSeal }) {
           </div>
         );
       })}
-    </div>
-  );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CARDS OF CHAOS TAB
-// ─────────────────────────────────────────────────────────────────────────────
-const CARD_COST = 5;
-const MAX_DRAWS = 2;
-
-const CHAOS_CARDS = [
-  { id:1,  emoji:"🃏", name:"Lip Sync for Your Life",              rarity:"RARE",      rarityColor:"#60a5fa", accent:"#c2185b", bg:"linear-gradient(160deg,#6d0030 0%,#180008 55%,#3d0018 100%)", action:"self",   description:"Double your points if your queen wins the lip sync this week.",                                    logAction:(p)=>    `${p} is betting it all on the lip sync — if their queen slays the stage, they walk away with double points. 🎤` },
-  { id:2,  emoji:"👑", name:"Main Stage Moment",                   rarity:"LEGENDARY", rarityColor:"#fbbf24", accent:"#d4af37", bg:"linear-gradient(160deg,#7a5800 0%,#180008 55%,#5a3d00 100%)", action:"self",   description:"Triple points if your queen wins the maxi challenge.",                                               logAction:(p)=>    `${p} is going for the crown — if their queen takes the maxi challenge win, they score triple points. 👑` },
-  { id:3,  emoji:"💀", name:"The Shantay",                         rarity:"UNCOMMON",  rarityColor:"#4ade80", accent:"#9c27b0", bg:"linear-gradient(160deg,#4a1070 0%,#180008 55%,#2a0050 100%)", action:"self",   description:"If your queen lands in the bottom 2 but survives, you get bonus points instead of losing them.",       logAction:(p)=>    `${p} is playing it risky — if their queen lands in the bottom 2 but survives, they earn bonus points instead of taking an L. 💀` },
-  { id:4,  emoji:"🔮", name:"Read for Filth",                      rarity:"RARE",      rarityColor:"#60a5fa", accent:"#1e88e5", bg:"linear-gradient(160deg,#0d3a7a 0%,#180008 55%,#0a2550 100%)", action:"target", description:"Steal 5 points from another player this episode.",           targetLabel:"Who are you reading?",         logAction:(p,t)=>  `${p} read ${t} to filth and snatched 5 points straight out of their pocket. The library is officially open. 🔮`, pointEffect:5 },
-  { id:5,  emoji:"🌪️", name:"Snatch the Crown",                    rarity:"LEGENDARY", rarityColor:"#fbbf24", accent:"#43a047", bg:"linear-gradient(160deg,#1a4d20 0%,#180008 55%,#0f3015 100%)", action:"target", description:"Swap one of your queens with another player's queen for one episode.", targetLabel:"Whose queen are you snatching?", logAction:(p,t)=> `${p} snatched a queen right out of ${t}'s lineup for this episode. Their roster just got a glow-up — or a curse. 🌪️` },
-  { id:6,  emoji:"⚡", name:"Werk Room Sabotage",                   rarity:"UNCOMMON",  rarityColor:"#4ade80", accent:"#e53935", bg:"linear-gradient(160deg,#7a1010 0%,#180008 55%,#500a0a 100%)", action:"target", description:"Force another player to skip playing their card this episode.", targetLabel:"Who are you sabotaging?",      logAction:(p,t)=>  `${p} snuck into the werk room and cut the power on ${t} — their card is blocked this episode. ⚡` },
-  { id:7,  emoji:"🎭", name:"Safe Word",                            rarity:"COMMON",    rarityColor:"#94a3b8", accent:"#78909c", bg:"linear-gradient(160deg,#2a3540 0%,#180008 55%,#1a2530 100%)", action:"self",   description:"Protect your score from any negative points this week.",                                            logAction:(p)=>    `${p} called it — Safe Word activated. No negative points can touch them this episode. 🎭` },
-  { id:8,  emoji:"🌟", name:"Charisma, Uniqueness, Nerve & Talent", rarity:"LEGENDARY", rarityColor:"#fbbf24", accent:"#e91e8c", bg:"linear-gradient(160deg,#7a0050 0%,#180008 55%,#500035 100%)", action:"self",   description:"Multiplies your total score by 1.5x for the episode.",                                               logAction:(p)=>    `${p} said C.U.N.T. and meant it — every point this episode is multiplied by 1.5x. 🌟` },
-  { id:9,  emoji:"🪞", name:"Mirror Mirror",                        rarity:"LEGENDARY", rarityColor:"#fbbf24", accent:"#7c83ff", bg:"linear-gradient(160deg,#1a1a5e 0%,#180008 55%,#0d0d3d 100%)", action:"target", description:"Copy the card effect of another player this episode.", targetLabel:"Who are you mirroring?",          logAction:(p,t)=>  `${p} held up the mirror — whatever card ${t} plays this episode, ${p} gets the same effect. 🪞` },
-  { id:10, emoji:"🍵", name:"Spill the Tea",                        rarity:"UNCOMMON",  rarityColor:"#4ade80", accent:"#ff8f00", bg:"linear-gradient(160deg,#5a3000 0%,#180008 55%,#3d1d00 100%)", action:"target", description:"Reveal another player's card to the entire group.",         targetLabel:"Whose tea are you spilling?",  logAction:(p,t)=>  `${p} spilled ALL of ${t}'s tea — their card hand is now public knowledge. 🍵` },
-  { id:11, emoji:"💸", name:"Point Heist",                          rarity:"RARE",      rarityColor:"#60a5fa", accent:"#00bfa5", bg:"linear-gradient(160deg,#004d40 0%,#180008 55%,#00332a 100%)", action:"gamble", description:"Flip a coin — heads you gain 10 points, tails you lose 5.",                                          logAction:(p,_,r)=> r==="win" ? `${p} flipped heads and won +10 points. Fortune favors the delusional. 💸` : `${p} flipped tails and lost 5 points. The drag gods are not pleased. 💸` },
-  { id:12, emoji:"🧿", name:"Evil Eye",                             rarity:"RARE",      rarityColor:"#60a5fa", accent:"#651fff", bg:"linear-gradient(160deg,#1a0050 0%,#180008 55%,#0d0033 100%)", action:"target", description:"Curse another player — their top queen earns zero points this episode.", targetLabel:"Who are you cursing?", logAction:(p,t)=> `${p} put the evil eye on ${t} — their top queen earns zero points this episode. Light a candle. 🧿` },
-  { id:13, emoji:"🎀", name:"Gag Gift",                             rarity:"UNCOMMON",  rarityColor:"#4ade80", accent:"#f06292", bg:"linear-gradient(160deg,#6d1a3a 0%,#180008 55%,#4a0d25 100%)", action:"gift",   description:"Give another player a random card from the deck.", targetLabel:"Who's getting the gift?",               logAction:(p,t,_,g)=> `${p} handed ${t} a mystery card${g?` — it's ${g.emoji} ${g.name}`:""}. Chaotic? Absolutely. 🎀` },
-  { id:14, emoji:"🪦", name:"The Dead Card",                        rarity:"CURSED",    rarityColor:"#a855f7", accent:"#6b21a8", bg:"linear-gradient(160deg,#111 0%,#180008 55%,#0a0a0a 100%)",    action:"self",   description:"You drew the dead card — no scoring and no card play for you this episode.",                           logAction:(p)=>    `${p} pulled the dead card. No scoring, no card play, no mercy. 🪦` },
-  { id:15, emoji:"🔁", name:"Ru-Do-Over",                           rarity:"LEGENDARY", rarityColor:"#fbbf24", accent:"#ff6d00", bg:"linear-gradient(160deg,#4a2000 0%,#180008 55%,#301400 100%)", action:"self",   description:"Cancel the last card played by anyone in the game.",                                                 logAction:(p)=>    `${p} played the Ru-Do-Over — the last card in the log has been cancelled. Ru said so. 🔁` },
-  { id:16, emoji:"💋", name:"The Lip Service",                      rarity:"RARE",      rarityColor:"#60a5fa", accent:"#e040fb", bg:"linear-gradient(160deg,#6d0060 0%,#180008 55%,#4a0040 100%)", action:"self",   description:"Award yourself 10 bonus points for sheer audacity. No conditions.", pointEffect:10,                     logAction:(p)=>    `${p} played Lip Service and awarded themselves 10 bonus points for sheer audacity alone. 💋` },
-  { id:17, emoji:"🕵️", name:"The Undercover Queen",                 rarity:"UNCOMMON",  rarityColor:"#4ade80", accent:"#b0bec5", bg:"linear-gradient(160deg,#1a1a1a 0%,#180008 55%,#111 100%)",    action:"self",   description:"Your score is hidden from all other players until final scoring.",                                    logAction:(p)=>    `${p} went undercover — their score is now hidden from everyone until final scoring. 🕵️` },
-  { id:18, emoji:"🎲", name:"Chaos Theory",                         rarity:"CURSED",    rarityColor:"#a855f7", accent:"#ff4081", bg:"linear-gradient(160deg,#3d0020 0%,#180008 55%,#280015 100%)", action:"chaos",  description:"A random card effect is applied to a random player — even you. Pure chaos.",                         logAction:(p,t,_,r)=> `${p} unleashed Chaos Theory — ${r?`${r.emoji} ${r.name}`:"a random effect"} was applied to ${t||"a random player"}. 🎲` },
-  { id:19, emoji:"🫶", name:"Sisterhood Bonus",                     rarity:"COMMON",    rarityColor:"#94a3b8", accent:"#ff8a65", bg:"linear-gradient(160deg,#3d1a00 0%,#180008 55%,#281000 100%)", action:"target", description:"Give 5 points to another player AND earn 5 points yourself.", targetLabel:"Who are you sharing the love with?", pointEffect:5, logAction:(p,t)=> `${p} played Sisterhood Bonus — ${t} gets 5 points AND ${p} gets 5 points. Love is in the werk room. 🫶` },
-  { id:20, emoji:"👠", name:"Stiletto Strike",                      rarity:"RARE",      rarityColor:"#60a5fa", accent:"#f50057", bg:"linear-gradient(160deg,#5a0a40 0%,#180008 55%,#3d0028 100%)", action:"target", description:"Reduce another player's score by 10 points this episode.", targetLabel:"Who are you striking?",        logAction:(p,t)=>  `${p} brought down the stiletto on ${t} — 10 points deducted from their score this episode. 👠` },
-];
-
-function ChaosCard({ card, revealed }) {
-  const [mouse, setMouse] = useState({ x:0.5, y:0.5 });
-  const [hovered, setHovered] = useState(false);
-  const ref = useRef(null);
-  const onMM = (e) => {
-    if (!ref.current) return;
-    const r = ref.current.getBoundingClientRect();
-    setMouse({ x:(e.clientX-r.left)/r.width, y:(e.clientY-r.top)/r.height });
-  };
-  const tiltX = hovered && revealed ? (mouse.y-0.5)*-10 : 0;
-  const tiltY = hovered && revealed ? (mouse.x-0.5)*10  : 0;
-  return (
-    <div ref={ref} style={{ width:200, height:290, perspective:1100, flexShrink:0 }}
-      onMouseEnter={()=>setHovered(true)} onMouseLeave={()=>{setHovered(false);setMouse({x:.5,y:.5});}} onMouseMove={onMM}>
-      <div style={{ width:"100%", height:"100%", position:"relative", transformStyle:"preserve-3d",
-        transition:"transform 0.7s cubic-bezier(0.25,1.3,0.5,1)",
-        transform: revealed ? `rotateY(180deg) rotateX(${tiltX}deg) rotateY(${tiltY}deg) scale(${hovered?1.03:1})` : `rotateY(0deg) scale(${hovered?1.04:1})`,
-        filter: hovered && !revealed ? "drop-shadow(0 0 18px rgba(245,200,66,0.4))" : "none" }}>
-        {/* Back */}
-        <div style={{ position:"absolute", inset:0, backfaceVisibility:"hidden", WebkitBackfaceVisibility:"hidden", borderRadius:14,
-          background:"linear-gradient(160deg,#4d0012 0%,#220006 55%,#160003 100%)", border:`2px solid ${C.goldDark}66`,
-          display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", overflow:"hidden",
-          boxShadow:"0 10px 30px rgba(0,0,0,0.7)" }}>
-          <div style={{ position:"absolute", inset:0, opacity:0.07, backgroundImage:"repeating-linear-gradient(45deg,#f5c842 0,#f5c842 1px,transparent 1px,transparent 14px),repeating-linear-gradient(-45deg,#f5c842 0,#f5c842 1px,transparent 1px,transparent 14px)" }} />
-          <div style={{ position:"absolute", inset:10, border:`1px solid ${C.goldDark}22`, borderRadius:8 }} />
-          <div style={{ fontSize:36, marginBottom:10, filter:"drop-shadow(0 0 12px rgba(245,200,66,0.6))" }}>🎭</div>
-          <div style={{ color:C.gold, fontSize:9, fontWeight:700, letterSpacing:3.5, textTransform:"uppercase", fontFamily:"'Cinzel',serif" }}>Cards of Chaos</div>
-          <div style={{ position:"absolute", inset:0, borderRadius:14, pointerEvents:"none",
-            background: hovered ? "linear-gradient(135deg,rgba(245,200,66,0.15) 0%,transparent 50%)" : "linear-gradient(135deg,rgba(245,200,66,0.06) 0%,transparent 55%)", transition:"background 0.3s" }} />
-        </div>
-        {/* Front */}
-        <div style={{ position:"absolute", inset:0, backfaceVisibility:"hidden", WebkitBackfaceVisibility:"hidden",
-          transform:"rotateY(180deg)", borderRadius:14, background:card.bg, border:`2px solid ${C.goldDark}88`,
-          display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"space-between",
-          padding:"14px 14px 12px", overflow:"hidden", boxShadow:"0 10px 30px rgba(0,0,0,0.7)" }}>
-          <div style={{ position:"absolute", top:0, left:0, right:0, height:"50%", pointerEvents:"none", background:`radial-gradient(ellipse at 50% -10%,${card.accent}50 0%,transparent 65%)` }} />
-          <div style={{ position:"absolute", inset:8, border:`1px solid ${C.goldDark}22`, borderRadius:8, pointerEvents:"none" }} />
-          <div style={{ alignSelf:"flex-end", zIndex:2 }}>
-            <span style={{ background:"rgba(0,0,0,0.5)", border:`1px solid ${card.rarityColor}55`, borderRadius:20, padding:"2px 8px", fontSize:7, fontWeight:800, letterSpacing:2, color:card.rarityColor, fontFamily:"'Cinzel',serif", textTransform:"uppercase" }}>{card.rarity}</span>
-          </div>
-          <div style={{ fontSize:44, lineHeight:1, zIndex:2, filter:`drop-shadow(0 0 14px ${card.accent}cc)` }}>{card.emoji}</div>
-          <div style={{ fontFamily:"'Cinzel',serif", fontWeight:700, color:C.offWhite, fontSize:card.name.length>22?11:13, textAlign:"center", lineHeight:1.3, zIndex:2, padding:"0 2px" }}>{card.name}</div>
-          <div style={{ width:"70%", height:1, zIndex:2, background:`linear-gradient(90deg,transparent,${card.accent}aa,${C.goldDark}99,${card.accent}aa,transparent)` }} />
-          <div style={{ color:"rgba(255,238,221,0.72)", fontSize:10, textAlign:"center", lineHeight:1.5, fontFamily:"'Lato',sans-serif", zIndex:2, padding:"0 2px" }}>{card.description}</div>
-          <div style={{ position:"absolute", inset:0, borderRadius:14, pointerEvents:"none", opacity:hovered?0.35:0.08,
-            background:`radial-gradient(circle at ${mouse.x*100}% ${mouse.y*100}%,rgba(255,255,255,0.6) 0%,transparent 50%),linear-gradient(125deg,#f5c842 0%,#e8407a 25%,#7c83ff 50%,#00bfa5 75%,#f5c842 100%)`,
-            mixBlendMode:"overlay", transition:"opacity 0.25s" }} />
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function ChaosPlayerPicker({ card, players, myId, onSelect, onCancel }) {
-  return (
-    <div style={{ position:"fixed", inset:0, zIndex:200, background:"rgba(0,0,0,0.88)", display:"flex", alignItems:"center", justifyContent:"center", padding:20, backdropFilter:"blur(6px)" }}>
-      <div style={{ background:`linear-gradient(160deg,${C.bgMid},${C.bgDeep})`, border:`1px solid ${C.goldDark}66`, borderRadius:16, padding:"28px 24px", maxWidth:380, width:"100%", boxShadow:"0 24px 80px rgba(0,0,0,0.9)" }}>
-        <div style={{ display:"flex", alignItems:"center", gap:14, marginBottom:20 }}>
-          <div style={{ width:48, height:48, borderRadius:10, background:card.bg, border:`1px solid ${C.goldDark}44`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:24, flexShrink:0 }}>{card.emoji}</div>
-          <div>
-            <div style={{ color:C.gold, fontSize:13, fontWeight:700, fontFamily:"'Cinzel',serif", marginBottom:2 }}>{card.name}</div>
-            <div style={{ color:C.textMid, fontSize:11, fontFamily:"'Lato',sans-serif" }}>{card.targetLabel}</div>
-          </div>
-        </div>
-        <div style={{ height:1, background:`linear-gradient(90deg,transparent,${C.goldDark}44,transparent)`, marginBottom:16 }} />
-        <div style={{ display:"flex", flexDirection:"column", gap:8, marginBottom:18 }}>
-          {players.filter(p=>p.id!==myId).map(p => (
-            <button key={p.id} onClick={()=>onSelect(p)}
-              style={{ background:`${C.bgDeep}88`, border:`1px solid ${C.bgLight}`, borderRadius:10, padding:"10px 14px", display:"flex", alignItems:"center", gap:12, cursor:"pointer", transition:"all 0.15s", fontFamily:"'Lato',sans-serif", textAlign:"left" }}
-              onMouseEnter={e=>{e.currentTarget.style.background=`${C.bgMid}cc`;e.currentTarget.style.borderColor=C.goldDark;}}
-              onMouseLeave={e=>{e.currentTarget.style.background=`${C.bgDeep}88`;e.currentTarget.style.borderColor=C.bgLight;}}>
-              <div style={{ flex:1 }}>
-                <div style={{ color:C.white, fontSize:13, fontWeight:700 }}>{p.name}</div>
-                <div style={{ color:C.textDim, fontSize:11 }}>{p.points} pts · {p.queen||"No queen"}</div>
-              </div>
-              <span style={{ color:C.textDim, fontSize:16 }}>›</span>
-            </button>
-          ))}
-        </div>
-        <button onClick={onCancel} style={{ ...S.ghost, width:"100%", textAlign:"center" }}>Cancel</button>
-      </div>
-    </div>
-  );
-}
-
-function ChaosGambleModal({ onResult }) {
-  const [flipping, setFlipping] = useState(false);
-  const [result, setResult]     = useState(null);
-  const flip = () => {
-    setFlipping(true);
-    setTimeout(() => {
-      const won = Math.random() > 0.5;
-      setResult(won ? "win" : "lose");
-      setFlipping(false);
-    }, 1200);
-  };
-  return (
-    <div style={{ position:"fixed", inset:0, zIndex:200, background:"rgba(0,0,0,0.9)", display:"flex", alignItems:"center", justifyContent:"center", padding:20, backdropFilter:"blur(8px)" }}>
-      <div style={{ background:`linear-gradient(160deg,#003d35,${C.bgDeep})`, border:"1px solid rgba(0,191,165,0.4)", borderRadius:16, padding:"32px 28px", maxWidth:340, width:"100%", textAlign:"center", boxShadow:"0 24px 80px rgba(0,0,0,0.9)" }}>
-        <div style={{ fontSize:28, marginBottom:6 }}>💸</div>
-        <div style={{ color:"#00bfa5", fontSize:16, fontWeight:700, fontFamily:"'Cinzel',serif", marginBottom:8 }}>Point Heist</div>
-        <div style={{ color:C.textMid, fontSize:12, fontFamily:"'Lato',sans-serif", marginBottom:24, lineHeight:1.6 }}>Flip the coin. Heads = +10 pts. Tails = −5 pts.</div>
-        <div style={{ display:"flex", justifyContent:"center", marginBottom:24 }}>
-          <div style={{ width:70, height:70, borderRadius:"50%",
-            background: result==="win" ? "linear-gradient(135deg,#ffd700,#b8860b)" : result==="lose" ? "linear-gradient(135deg,#555,#333)" : "linear-gradient(135deg,#f5c842,#8B6914)",
-            border:`3px solid ${C.goldDark}`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:30,
-            boxShadow: result==="win" ? "0 0 28px rgba(255,215,0,0.7)" : "0 0 12px rgba(0,0,0,0.4)",
-            animation: flipping ? "chaos-spin 1.2s ease" : "none" }}>
-            {flipping ? "🌀" : result==="win" ? "👑" : result==="lose" ? "💀" : "🪙"}
-          </div>
-        </div>
-        <style>{`@keyframes chaos-spin{0%{transform:rotateY(0)}50%{transform:rotateY(900deg) scale(1.2)}100%{transform:rotateY(1800deg)}}`}</style>
-        {result && (
-          <div style={{ marginBottom:20 }}>
-            <div style={{ color:result==="win"?"#ffd700":"#ef5350", fontSize:15, fontWeight:700, fontFamily:"'Cinzel',serif", marginBottom:4 }}>
-              {result==="win" ? "HEADS! +10 points!" : "TAILS! −5 points."}
-            </div>
-            <div style={{ color:C.textDim, fontSize:11, fontFamily:"'Lato',sans-serif" }}>
-              {result==="win" ? "Fortune favors the delusional, darling." : "The drag gods are displeased."}
-            </div>
-          </div>
-        )}
-        {!result && <button onClick={flip} disabled={flipping} style={{ ...S.goldBtn, width:"100%", opacity:flipping?.6:1 }}>{flipping?"Flipping…":"🪙 Flip the Coin"}</button>}
-        {result  && <button onClick={()=>onResult(result)} style={{ ...S.goldBtn, width:"100%" }}>{result==="win"?"✨ Collect Winnings":"😤 Accept Fate"}</button>}
-      </div>
-    </div>
-  );
-}
-
-function ChaosTab({ room, myId, me, isHost, onUpdateRoom }) {
-  const chaosState  = room.chaos || {};
-  const myState     = chaosState[myId] || { drawsLeft: MAX_DRAWS, points: me?.points || 0, usedIds:[], log:[] };
-  const myDraws     = myState.drawsLeft ?? MAX_DRAWS;
-  const myPts       = myState.points   ?? (me?.points || 0);
-  const myUsedIds   = myState.usedIds  || [];
-  const chaosLog    = chaosState.log   || [];
-  const [phase, setPhase]       = useState("idle");
-  const [drawnCard, setDrawnCard] = useState(null);
-  const [glitter, setGlitter]   = useState(false);
-  const [showGallery, setShowGallery] = useState(false);
-  const [pickerOpen, setPickerOpen]   = useState(false);
-  const [gambleOpen, setGambleOpen]   = useState(false);
-  const [flash, setFlash]             = useState(null);
-
-  const available   = CHAOS_CARDS.filter(c => !myUsedIds.includes(c.id));
-  const canAfford   = myPts >= CARD_COST;
-  const canDraw     = canAfford && myDraws > 0;
-  const isDrawPhase = phase === "flipping" || phase === "revealed";
-  const otherPlayers = (room.players || []).filter(p => p.id !== myId);
-
-  function saveChaosPatch(patch) {
-    onUpdateRoom(r => ({ ...r, chaos: { ...(r.chaos||{}), ...patch } }));
-  }
-
-  function flashPoints(amt) {
-    setFlash(amt > 0 ? `+${amt}` : `${amt}`);
-    const newPts = myPts + amt;
-    saveChaosPatch({ [myId]: { ...myState, points: newPts } });
-    setTimeout(() => setFlash(null), 1800);
-  }
-
-  function handleShuffle() {
-    if (!canDraw) return;
-    setPhase("shuffling");
-    setTimeout(() => setPhase("ready"), 700);
-  }
-
-  function handleDraw() {
-    if (!canDraw) return;
-    const card = available[Math.floor(Math.random() * available.length)];
-    setDrawnCard(card);
-    const newDraws = myDraws - 1;
-    const newPts   = myPts - CARD_COST;
-    setFlash(`−${CARD_COST}`);
-    setTimeout(() => setFlash(null), 1800);
-    saveChaosPatch({ [myId]: { ...myState, drawsLeft: newDraws, points: newPts } });
-    setPhase("flipping");
-    setTimeout(() => {
-      setPhase("revealed");
-      setTimeout(() => setGlitter(true), 60);
-      setTimeout(() => setGlitter(false), 900);
-    }, 720);
-  }
-
-  function handlePlayCard() {
-    if (!drawnCard) return;
-    if (drawnCard.action === "target" || drawnCard.action === "gift") { setPickerOpen(true); return; }
-    if (drawnCard.action === "gamble") { setGambleOpen(true); return; }
-    if (drawnCard.action === "chaos")  { handleChaosAction(); return; }
-    commitPlay(drawnCard, null);
-  }
-
-  function handleSelectTarget(player) {
-    setPickerOpen(false);
-    if (drawnCard.action === "gift") {
-      const pool = CHAOS_CARDS.filter(c => c.id !== drawnCard.id);
-      const giftCard = pool[Math.floor(Math.random() * pool.length)];
-      commitPlay(drawnCard, player, null, giftCard);
-    } else {
-      if (drawnCard.pointEffect) flashPoints(drawnCard.pointEffect);
-      commitPlay(drawnCard, player);
-    }
-  }
-
-  function handleGambleResult(result) {
-    setGambleOpen(false);
-    if (result === "win") flashPoints(+10);
-    else                  flashPoints(-5);
-    commitPlay(drawnCard, null, result);
-  }
-
-  function handleChaosAction() {
-    const randomCard   = CHAOS_CARDS[Math.floor(Math.random() * CHAOS_CARDS.length)];
-    const randomPlayer = room.players[Math.floor(Math.random() * room.players.length)];
-    commitPlay(drawnCard, randomPlayer, null, randomCard);
-  }
-
-  function commitPlay(card, target, gamblerResult=null, extraCard=null) {
-    if (card.pointEffect && card.action === "self") flashPoints(card.pointEffect);
-    if (card.id === 15) {
-      // Ru-Do-Over: remove last log entry
-      const newLog = [...chaosLog].slice(1);
-      saveChaosPatch({ log: newLog });
-    }
-    const time = new Date().toLocaleTimeString([], { hour:"2-digit", minute:"2-digit" });
-    const entry = { id: Date.now().toString(), playerName: me?.name || "You", card, target: target ? { name: target.name } : null, gamblerResult, extraCard: extraCard || null, episode: room.episodes?.length + 1 || 1, time };
-    const newLog = [entry, ...chaosLog];
-    const newUsed = [...myUsedIds, card.id];
-    saveChaosPatch({ [myId]: { ...myState, usedIds: newUsed }, log: newLog });
-    setDrawnCard(null);
-    setGlitter(false);
-    setPhase("idle");
-  }
-
-  const palGold = C.gold;
-  const font = "'Cinzel',serif";
-
-  return (
-    <div className="fade">
-      <style>{`
-        @keyframes chaos-fade-up{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
-        @keyframes chaos-deck-shake{0%{transform:rotate(0)}20%{transform:rotate(-4deg) translateX(-8px)}40%{transform:rotate(4deg) translateX(8px)}60%{transform:rotate(-2deg)}80%{transform:rotate(2deg)}100%{transform:rotate(0)}}
-        @keyframes chaos-btn-pulse{0%,100%{box-shadow:0 4px 16px rgba(245,200,66,0.25)}50%{box-shadow:0 4px 24px rgba(245,200,66,0.5)}}
-      `}</style>
-
-      {pickerOpen && drawnCard && <ChaosPlayerPicker card={drawnCard} players={room.players} myId={myId} onSelect={handleSelectTarget} onCancel={()=>setPickerOpen(false)} />}
-      {gambleOpen && <ChaosGambleModal onResult={handleGambleResult} />}
-
-      <SecTitle>Cards of Chaos</SecTitle>
-      <p style={{ color:C.textMid, fontSize:12, marginBottom:20, fontFamily:"'Lato',sans-serif", lineHeight:1.6 }}>
-        Spend {CARD_COST} pts to draw a card. You get {MAX_DRAWS} draws per season. Target cards let you affect other players. Pure chaos guaranteed.
-      </p>
-
-      {/* Balance bar */}
-      <div className="card" style={{ padding:"12px 16px", marginBottom:18, display:"flex", gap:18, flexWrap:"wrap", alignItems:"center" }}>
-        <div style={{ position:"relative" }}>
-          <StatBox label="Your Balance" value={`${myPts} pts`} gold />
-          {flash && (
-            <div style={{ position:"absolute", top:-24, left:"50%", transform:"translateX(-50%)", color: flash.startsWith("+")?"#4ade80":"#ef5350", fontSize:15, fontWeight:800, fontFamily:font, whiteSpace:"nowrap", animation:"chaos-fade-up 1.8s ease forwards", pointerEvents:"none" }}>{flash}</div>
-          )}
-        </div>
-        <StatBox label="Draws Left"   value={`${myDraws} / ${MAX_DRAWS}`} />
-        <StatBox label="Card Cost"    value={`${CARD_COST} pts`} />
-        <StatBox label="Cards Played" value={myUsedIds.length} />
-      </div>
-
-      {/* Warnings */}
-      {myDraws === 0 && !isDrawPhase && (
-        <div className="card" style={{ padding:"12px 16px", marginBottom:16, border:`1px solid ${C.red}44`, textAlign:"center" }}>
-          <div style={{ color:C.pinkLight, fontSize:13, fontWeight:700, fontFamily:font }}>🚫 No draws remaining this season</div>
-          <div style={{ color:C.textDim, fontSize:11, marginTop:4, fontFamily:"'Lato',sans-serif" }}>You've used both draws. See you next season!</div>
-        </div>
-      )}
-      {myDraws > 0 && !canAfford && !isDrawPhase && (
-        <div className="card" style={{ padding:"12px 16px", marginBottom:16, border:`1px solid ${C.red}44`, textAlign:"center" }}>
-          <div style={{ color:C.pinkLight, fontSize:13, fontWeight:700, fontFamily:font }}>💸 Not enough points to draw</div>
-          <div style={{ color:C.textDim, fontSize:11, marginTop:4, fontFamily:"'Lato',sans-serif" }}>You need {CARD_COST} pts — earn more by scoring this episode.</div>
-        </div>
-      )}
-
-      {/* Deck + buttons */}
-      {!isDrawPhase && (
-        <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:22, marginBottom:32, animation:"chaos-fade-up 0.4s ease" }}>
-          <div style={{ position:"relative", animation: phase==="shuffling" ? "chaos-deck-shake 0.7s ease" : "none" }}>
-            {[3,2,1].map(i => (
-              <div key={i} style={{ position:"absolute", inset:0, borderRadius:14, background:"linear-gradient(160deg,#4d0012,#160003)", border:`2px solid ${C.goldDark}22`, transform:`translate(${i*3}px,${i*3}px)`, zIndex:-i }} />
-            ))}
-            <div onClick={()=>{ if(phase==="ready"&&canDraw) handleDraw(); }} style={{ cursor: phase==="ready"&&canDraw ? "pointer" : "default" }}>
-              <ChaosCard card={CHAOS_CARDS[0]} revealed={false} />
-            </div>
-            {phase !== "ready" && (
-              <div style={{ position:"absolute", inset:0, borderRadius:14, background:"rgba(0,0,0,0.35)", display:"flex", alignItems:"center", justifyContent:"center", pointerEvents:"none" }}>
-                <span style={{ color:`${palGold}55`, fontSize:9, letterSpacing:3, textTransform:"uppercase", fontFamily:"'Lato',sans-serif" }}>{phase==="shuffling"?"Shuffling…":"Shuffle first"}</span>
-              </div>
-            )}
-            {phase==="ready" && canDraw && (
-              <div style={{ position:"absolute", inset:0, borderRadius:14, display:"flex", alignItems:"flex-end", justifyContent:"center", paddingBottom:12, pointerEvents:"none" }}>
-                <span style={{ color:`${palGold}88`, fontSize:9, letterSpacing:2, textTransform:"uppercase", fontFamily:"'Lato',sans-serif", background:"rgba(0,0,0,0.5)", padding:"2px 10px", borderRadius:20, border:`1px solid ${C.goldDark}33` }}>tap to draw</span>
-              </div>
-            )}
-          </div>
-
-          <div style={{ display:"flex", flexDirection:"column", gap:12, width:240 }}>
-            {!canDraw ? (
-              <div style={{ background:`${C.bgDeep}88`, border:`1px solid ${C.bgLight}`, color:C.textDim, borderRadius:8, padding:"13px", textAlign:"center", fontSize:12, letterSpacing:2, textTransform:"uppercase", fontFamily:font }}>
-                🔒 {myDraws===0?"No Draws Left":"Not Enough Points"}
-              </div>
-            ) : phase !== "ready" ? (
-              <button onClick={handleShuffle} disabled={phase==="shuffling"} style={{ ...S.goldBtn, animation:"chaos-btn-pulse 2.5s ease-in-out infinite", opacity:phase==="shuffling"?.7:1 }}>
-                🔀 Shuffle the Deck
-              </button>
-            ) : (
-              <button onClick={handleDraw} style={{ ...S.redBtn }}>
-                🃏 Draw Your Card · {CARD_COST} pts
-              </button>
-            )}
-          </div>
-          <div style={{ color:C.textDim, fontSize:10, letterSpacing:1, textTransform:"uppercase", fontFamily:"'Lato',sans-serif" }}>
-            {available.length} of {CHAOS_CARDS.length} cards remaining
-          </div>
-        </div>
-      )}
-
-      {/* Drawn card */}
-      {isDrawPhase && drawnCard && (
-        <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:20, marginBottom:32, animation:"chaos-fade-up 0.4s ease" }}>
-          <div style={{ color:palGold, fontSize:10, letterSpacing:5, textTransform:"uppercase", fontFamily:font, opacity:phase==="revealed"?1:0, transition:"opacity 0.5s 0.3s" }}>✦ You Drew ✦</div>
-          <ChaosCard card={drawnCard} revealed={phase==="revealed"} />
-          {phase==="revealed" && (
-            <div style={{ display:"flex", flexDirection:"column", gap:10, width:240, animation:"chaos-fade-up 0.4s ease 0.2s both" }}>
-              {(drawnCard.action==="target"||drawnCard.action==="gift") && (
-                <div style={{ textAlign:"center", color:C.textMid, fontSize:11, fontFamily:"'Lato',sans-serif" }}>🎯 {drawnCard.targetLabel}</div>
-              )}
-              <button onClick={handlePlayCard} style={{
-                ...(drawnCard.action==="self" ? S.goldBtn : S.redBtn),
-              }}>
-                {drawnCard.action==="target"||drawnCard.action==="gift" ? "🎯 Choose Your Target"
-                  : drawnCard.action==="gamble" ? "🪙 Flip the Coin"
-                  : drawnCard.action==="chaos"  ? "🎲 Unleash the Chaos"
-                  : "✨ Play This Card"}
-              </button>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Chaos Log */}
-      <div style={{ marginBottom:24 }}>
-        <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:14 }}>
-          <div style={{ flex:1, height:1, background:`linear-gradient(90deg,transparent,${C.bgLight})` }} />
-          <div style={{ color:palGold, fontSize:10, letterSpacing:4, textTransform:"uppercase", fontFamily:font, whiteSpace:"nowrap" }}>✦ Chaos Log ✦</div>
-          <div style={{ flex:1, height:1, background:`linear-gradient(90deg,${C.bgLight},transparent)` }} />
-        </div>
-        <div style={{ textAlign:"center", marginBottom:12 }}>
-          <span style={{ background:`${C.goldDark}18`, border:`1px solid ${C.goldDark}33`, borderRadius:20, padding:"3px 14px", color:C.textDim, fontSize:9, letterSpacing:3, textTransform:"uppercase", fontFamily:"'Lato',sans-serif" }}>
-            Episode {(room.episodes?.length||0)+1} · Active
-          </span>
-        </div>
-        {chaosLog.length === 0 ? (
-          <div className="card" style={{ padding:"28px 20px", textAlign:"center", border:`1px dashed ${C.bgLight}` }}>
-            <div style={{ color:C.textDim, fontSize:12, fontStyle:"italic", fontFamily:"'Lato',sans-serif" }}>
-              No cards played yet.<br /><span style={{ fontSize:10 }}>Be the first to unleash chaos.</span>
-            </div>
-          </div>
-        ) : (
-          <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
-            {chaosLog.map((entry, i) => (
-              <div key={entry.id} className="card" style={{ padding:"12px 14px", display:"flex", alignItems:"flex-start", gap:12, animation:`chaos-fade-up 0.3s ease ${i*0.05}s both` }}>
-                <div style={{ width:36, height:36, borderRadius:8, flexShrink:0, background:entry.card.bg, border:`1px solid ${entry.card.accent}55`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:18 }}>{entry.card.emoji}</div>
-                <div style={{ flex:1 }}>
-                  <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:4, flexWrap:"wrap" }}>
-                    <span style={{ color:entry.card.accent, fontWeight:700, fontFamily:font, fontSize:12 }}>{entry.card.name}</span>
-                    <span style={{ color:C.textDim, fontSize:10 }}>·</span>
-                    <span style={{ color:palGold, fontWeight:700, fontFamily:"'Lato',sans-serif", fontSize:11 }}>{entry.playerName}</span>
-                  </div>
-                  <div style={{ color:C.textMid, fontSize:11, lineHeight:1.5, fontFamily:"'Lato',sans-serif" }}>
-                    {entry.card.logAction(entry.playerName, entry.target?.name, entry.gamblerResult, entry.extraCard)}
-                  </div>
-                  <div style={{ color:C.textDim, fontSize:10, marginTop:4, fontFamily:"'Lato',sans-serif" }}>Ep {entry.episode} · {entry.time}</div>
-                </div>
-                <span style={{ fontSize:7, fontWeight:800, letterSpacing:2, color:entry.card.rarityColor, background:`${entry.card.rarityColor}18`, border:`1px solid ${entry.card.rarityColor}33`, borderRadius:20, padding:"2px 6px", textTransform:"uppercase", flexShrink:0, alignSelf:"center" }}>{entry.card.rarity}</span>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {/* Gallery */}
-      <div style={{ textAlign:"center", marginBottom:showGallery?24:0 }}>
-        <button onClick={()=>setShowGallery(v=>!v)} style={{ ...S.ghost, fontSize:11 }}>
-          {showGallery?"▲ Hide Full Deck":"▼ View Full Deck"}
-        </button>
-      </div>
-      {showGallery && (
-        <div style={{ display:"flex", flexWrap:"wrap", gap:16, justifyContent:"center", animation:"chaos-fade-up 0.4s ease" }}>
-          {CHAOS_CARDS.map((card,i) => (
-            <div key={card.id} style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:8, animation:`chaos-fade-up 0.3s ease ${i*0.05}s both` }}>
-              <ChaosCard card={card} revealed={true} />
-              {card.action!=="self"&&card.action!=="gamble"&&card.action!=="chaos" && (
-                <span style={{ background:`${C.pink}18`, border:`1px solid ${C.pink}44`, borderRadius:20, padding:"2px 8px", color:C.pinkLight, fontSize:8, letterSpacing:2, textTransform:"uppercase" }}>🎯 Targets Others</span>
-              )}
-              {myUsedIds.includes(card.id) && (
-                <span style={{ color:C.textDim, fontSize:8, letterSpacing:2, textTransform:"uppercase" }}>— Played —</span>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
-
-      <p style={{ marginTop:40, color:C.textDim, fontSize:9, letterSpacing:2, textTransform:"uppercase", textAlign:"center", fontFamily:"'Lato',sans-serif" }}>
-        ✦ {MAX_DRAWS} draws per season · {CARD_COST} pts per draw · May the best queen win ✦
-      </p>
     </div>
   );
 }
